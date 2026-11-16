@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>002 Slam button</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../shared/tokens.css">
+<style>
+  /* The page is the surface: ripples are drawn on it, under the slab. */
+  .surface {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  /* Never transformed, so it is a stable reference for the ripple origin. */
+  .stage {
+    position: relative;
+    display: grid;
+  }
+  .shadow {
+    position: absolute;
+    inset: 4px 8px;
+    border-radius: 999px;
+    background: #000;
+    filter: blur(12px);
+    opacity: 0;
+    pointer-events: none;
+    will-change: transform, opacity;
+  }
+  .slab {
+    --w: 148px;
+    --h: 60px;
+    position: relative;
+    width: var(--w);
+    height: var(--h);
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    will-change: transform;
+  }
+  /* The visible slab is drawn as a path so it can bend: its middle and
+     its ends can sit at different heights. The button is the hit target. */
+  .slab svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+    pointer-events: none;
+  }
+  .slab .face {
+    fill: var(--cell);
+    stroke: var(--ink);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+    stroke-linejoin: round;
+  }
+  /* Under-layers: copies of the outline between the slab and the page,
+     like sheets peeling up off a stack. */
+  .layers {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+    pointer-events: none;
+  }
+  .layers path {
+    fill: var(--cell);
+    stroke: var(--ink);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+    stroke-linejoin: round;
+  }
+  .slab .dent {
+    fill: none;
+    stroke: #000;
+    stroke-width: 8;
+    opacity: 0;
+    filter: blur(3px);
+  }
+  /* The label is printed on the slab, so it bends with it: each letter
+     is moved, scaled and turned to match the surface under it. */
+  .slab .label {
+    position: relative;
+    white-space: pre;
+    font: 500 15px/1 var(--font);
+    letter-spacing: -0.005em;
+    color: var(--ink);
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .slab .label span {
+    display: inline-block;
+    will-change: transform;
+  }
+  .slab:focus { outline: none; }
+  .slab:focus-visible {
+    outline: 2px solid var(--signal);
+    outline-offset: 5px;
+  }
+</style>
+</head>
+<body class="piece">
+
+<canvas class="surface" aria-hidden="true"></canvas>
+<div class="stage">
+  <span class="shadow" aria-hidden="true"></span>
+  <svg class="layers" viewBox="-74 -30 148 60" aria-hidden="true"></svg>
+  <button class="slab" aria-label="Floppy button">
+    <svg viewBox="-74 -30 148 60" aria-hidden="true">
+      <defs><clipPath id="slab-clip"><path class="clip"/></clipPath></defs>
+      <path class="face"/>
+      <g clip-path="url(#slab-clip)"><path class="dent"/></g>
+    </svg>
+    <span class="label" aria-hidden="true">Floppy button</span>
+  </button>
+</div>
+
+<script>
+(() => {
+  const slab = document.querySelector('.slab');
+  const stage = document.querySelector('.stage');
+  const shadow = document.querySelector('.shadow');
+  const face = slab.querySelector('.face');
+  const dentPath = slab.querySelector('.dent');
+  const clipPath = slab.querySelector('.clip');
+
+  // Split the label into letters, and find where each one sits along the
+  // slab (layout offsets, so the slab's own transform does not matter).
+  const label = slab.querySelector('.label');
+  const letters = [...label.textContent].map(ch => {
+    const el = document.createElement('span');
+    el.textContent = ch;
+    return { el, x: 0 };
+  });
+  label.textContent = '';
+  letters.forEach(l => label.appendChild(l.el));
+  function measureLetters() {
+    const mid = slab.offsetWidth / 2;
+    for (const l of letters) l.x = label.offsetLeft + l.el.offsetLeft + l.el.offsetWidth / 2 - mid;
+  }
+  const canvas = document.querySelector('.surface');
+  const ctx = canvas.getContext('2d');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const dark = matchMedia('(prefers-color-scheme: dark)');
+
+  // Height of the slab over the page, in units of its hover height.
+  // 1 = hovering, 0 = resting on the page, below 0 = pushed into it.
+  let z = 0, vz = 0;
+  let hovered = false, focusLift = false, pressed = false;
+  const DEPTH = -0.1;     // how far a held press sinks into the surface
+  const LIFT_PX = 12;     // hover height on screen
+
+  // Layers under the slab. Each one is pulled up by the one above it on
+  // a looser spring, so on hover they peel off the page one after another
+  // and fan out; on a slam the slab drives down through them and they
+  // collapse onto the page. Bottom-most first in the array.
+  const LAYERS = 3;
+  const layers = [];
+  {
+    const svgL = document.querySelector('.layers');
+    for (let i = 0; i < LAYERS; i++) {
+      const el = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      svgL.appendChild(el);
+      // Share of the slab's height this layer rides at, and its spring.
+      const frac = (i + 1) / (LAYERS + 1);
+      const k = 170 * (0.55 + 0.45 * frac);
+      layers.push({ el, frac, k, z: 0, v: 0 });
+    }
+  }
+
+  // Bend: how much higher the middle sits than the two ends, in the same
+  // units as z. The ends are like masses hung on the middle by a springy
+  // panel, so they lag whatever the middle does: lifting, the ends trail
+  // below; pushed down, they stay up; hitting the page, they keep going
+  // and slap down, then the panel wobbles out.
+  let b = 0, vb = 0;
+  // Ripples on the surface: each one is a short packet of crests that
+  // spreads out from the slab's outline through the dot grid.
+  let waves = [];
+
+  function calm() { return reduceMotion.matches; }
+
+  function step(h) {
+    const prev = z;
+    let a = 0;
+    if (pressed && z > 0) {
+      // Pushed down from the air: the hand drives it, gravity helps.
+      a = -70;
+    }
+    if (!pressed) {
+      // Floating: a soft spring with a little bob.
+      const target = hovered || focusLift ? 1 : 0;
+      const k = 170, c = 2 * Math.sqrt(k) * (calm() ? 1 : 0.5);
+      a += -k * (z - target) - c * vz;
+    }
+    if (z < 0 || (pressed && z <= 0)) {
+      // In contact the page is hard: a stiff spring. Held, the finger
+      // keeps it sunk in; released, the stored squash springs it back up.
+      const k = 2600, c = 2 * Math.sqrt(k) * (calm() ? 1 : 0.42);
+      a += -k * (z - (pressed ? DEPTH : 0)) - c * vz;
+    }
+    vz += a * h;
+    z += vz * h;
+    if (prev > 0 && z <= 0) impact(-vz);
+
+    // Layers: each follows its share of the slab's current height, top
+    // layer first, with less stiffness further down (more lag).
+    let ceiling = Math.max(z, 0);
+    for (let i = LAYERS - 1; i >= 0; i--) {
+      const L = layers[i];
+      const c = 2 * Math.sqrt(L.k) * (calm() ? 1 : 0.55);
+      L.v += (-L.k * (L.z - Math.max(z, 0) * L.frac) - c * L.v) * h;
+      L.z += L.v * h;
+      // A layer can't pass through the one above it, or the page below.
+      if (L.z > ceiling) { L.z = ceiling; L.v = Math.min(L.v, vz); }
+      if (L.z < 0) { L.z = 0; L.v = 0; }
+      ceiling = L.z;
+    }
+
+    // Held up by its middle, the slab sags a little at the ends; held
+    // down by a finger in the middle, the ends stand a little proud.
+    const up = Math.max(z, 0);
+    const bRest = pressed ? (z <= 0 ? -0.22 : 0) : 0.4 * up;
+    const kb = 900, cb = 2 * Math.sqrt(kb) * (calm() ? 1 : 0.22);
+    const drive = Math.max(-650, Math.min(650, a)) * (calm() ? 0.5 : 1.7);
+    vb += (-kb * (b - bRest) - cb * vb + drive) * h;
+    b += vb * h;
+  }
+
+  // The slab hits the page. Ripple strength follows impact speed, so a
+  // slam from the hover height makes waves and a set-down barely does.
+  function impact(speed) {
+    if (speed < 1.5) return;
+    const s = Math.min(speed / 12, 1.3);
+    waves.push({ t: 0, s });
+    if (waves.length > 8) waves.shift();
+  }
+
+  // Loop runs only while something moves.
+  let raf = 0, last = 0;
+  function wake() {
+    if (!raf) { last = performance.now(); raf = requestAnimationFrame(tick); }
+  }
+  function tick(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30);
+    last = now;
+    const steps = 4, h = dt / steps;
+    for (let i = 0; i < steps; i++) step(h);
+    for (const w of waves) w.t += dt;
+    waves = waves.filter(w => w.t < (calm() ? 1.4 : 2.2));
+
+    render();
+    const target = pressed ? DEPTH : hovered || focusLift ? 1 : 0;
+    const atRest = Math.abs(z - target) < 0.002 && Math.abs(vz) < 0.01 && !waves.length
+      && Math.abs(vb) < 0.01 && Math.abs(b - bAt(target)) < 0.002
+      && layers.every(L => Math.abs(L.v) < 0.01 && Math.abs(L.z - Math.max(target, 0) * L.frac) < 0.002);
+    if (atRest) {
+      z = target; vz = 0;
+      b = bAt(target); vb = 0;
+      for (const L of layers) { L.z = Math.max(target, 0) * L.frac; L.v = 0; }
+      render();
+      raf = 0;
+      return;
+    }
+    raf = requestAnimationFrame(tick);
+  }
+
+  function bAt(zr) { return pressed ? -0.22 : 0.4 * Math.max(zr, 0); }
+
+  // Outline of the slab with its bend applied. Points sit at height
+  // -b * u^2 relative to the middle (u = 0 middle, 1 at the ends), and
+  // lower points are drawn lower on screen and a touch smaller.
+  const HW = 74, HH = 30, CR = HH; // fully rounded ends
+  const BEND_PX = 10;   // on-screen drop of the ends per unit of bend
+  const outline = (() => {
+    const pts = [];
+    const arc = (cx, cy, a0) => {
+      for (let i = 0; i <= 14; i++) {
+        const t = a0 + (i / 14) * Math.PI / 2;
+        pts.push([cx + Math.cos(t) * CR, cy + Math.sin(t) * CR]);
+      }
+    };
+    const line = (x0, y0, x1, y1, n) => {
+      for (let i = 1; i < n; i++) pts.push([x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n]);
+    };
+    const ix = HW - CR, iy = HH - CR;
+    arc(ix, iy, 0);                        // bottom right
+    line(ix, HH, -ix, HH, 24);             // bottom edge
+    arc(-ix, iy, Math.PI / 2);             // bottom left
+    if (iy > 0) line(-HW, iy, -HW, -iy, 4); // left edge
+    arc(-ix, -iy, Math.PI);                // top left
+    line(-ix, -HH, ix, -HH, 24);           // top edge
+    arc(ix, -iy, Math.PI * 1.5);           // top right
+    if (iy > 0) line(HW, -iy, HW, iy, 4);   // right edge
+    return pts;
+  })();
+
+  function bentPath(bend) {
+    let d = '';
+    for (let i = 0; i < outline.length; i++) {
+      const [x, y] = outline[i];
+      const u = x / HW;
+      const hr = -bend * u * u;              // height relative to the middle
+      const s = 1 + hr * 0.06;
+      const px = x * s, py = y * s - hr * BEND_PX;
+      d += (i ? 'L' : 'M') + px.toFixed(2) + ' ' + py.toFixed(2);
+    }
+    return d + 'Z';
+  }
+
+  function render() {
+    const d = dark.matches ? 2.6 : 1;
+
+    // Lifted: rises toward you (up and slightly larger).
+    // Sunk: the footprint spreads as it is squashed into the page.
+    const up = Math.max(z, 0), down = Math.max(-z, 0);
+    const scale = 1 + up * 0.035 + down * 0.35;
+    slab.style.transform = `translateY(${-up * LIFT_PX}px) scale(${scale})`;
+
+    // Shadow only exists once there is air under the slab: higher means
+    // further away, larger, softer.
+    shadow.style.opacity = Math.min(up * 0.22 * d * (1.15 - 0.25 * up), 0.85);
+    shadow.style.transform =
+      `translateY(${3 + up * 10}px) scale(${0.92 + up * 0.08}, ${0.85 + up * 0.15})`;
+
+    const bend = Math.max(-1.4, Math.min(1.4, b));
+    const shape = bentPath(bend);
+    face.setAttribute('d', shape);
+
+    // Under-layers: same projection as the slab at their own height. Their
+    // bend follows the slab's, softer the lower they are. Edges fade
+    // toward the page so the stack reads as depth.
+    for (let i = 0; i < LAYERS; i++) {
+      const L = layers[i];
+      const vis = Math.min(L.z / 0.06, 1);
+      if (vis < 0.01) { L.el.style.opacity = 0; continue; }
+      L.el.style.opacity = vis;
+      L.el.style.strokeOpacity = (0.25 + 0.5 * L.frac).toFixed(3);
+      L.el.setAttribute('d', bentPath(bend * L.frac));
+      L.el.setAttribute('transform',
+        `translate(0 ${(-L.z * LIFT_PX).toFixed(2)}) scale(${(1 + L.z * 0.035).toFixed(4)})`);
+    }
+
+    // Same surface for the letters: drop, scale, and the slope's angle.
+    for (const l of letters) {
+      const u = l.x / HW;
+      const hr = -bend * u * u;
+      const ls = 1 + hr * 0.06;
+      const dy = -hr * BEND_PX;
+      const slope = (2 * bend * u * BEND_PX) / HW;
+      l.el.style.transform = hr === 0 ? '' :
+        `translate(${(l.x * (ls - 1)).toFixed(2)}px, ${dy.toFixed(2)}px) rotate(${Math.atan(slope).toFixed(4)}rad) scale(${ls.toFixed(4)})`;
+    }
+
+    // Pushed into the page: the rim of the dent shades the top edge.
+    const s = Math.min(down / 0.1, 1.6);
+    if (s > 0.01) {
+      clipPath.setAttribute('d', shape);
+      dentPath.setAttribute('d', shape);
+      dentPath.setAttribute('transform', `translate(0 ${(s * 3).toFixed(2)})`);
+      dentPath.style.opacity = Math.min(s * 0.16 * d, 0.6);
+    } else {
+      dentPath.style.opacity = 0;
+    }
+
+    drawSurface();
+  }
+
+  // --- Surface: a dot grid the ripples travel through ---------------------
+  //
+  // Each dot is a marker on the page surface. A passing crest pushes it
+  // outward and swells it, a trough pulls it back and shrinks it, so the
+  // wave shows as a band of motion moving through an otherwise still grid.
+
+  let dpr = 1, cw = 0, ch = 0;
+  function sizeCanvas() {
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    cw = innerWidth; ch = innerHeight;
+    canvas.width = Math.round(cw * dpr);
+    canvas.height = Math.round(ch * dpr);
+  }
+
+  let dotRGB, crestRGB;
+  function readColors() {
+    const root = getComputedStyle(document.documentElement);
+    dotRGB = hex(root.getPropertyValue('--muted'));
+    crestRGB = hex(root.getPropertyValue('--ink'));
+  }
+  function hex(s) {
+    s = s.trim().replace('#', '');
+    if (s.length === 3) s = [...s].map(c => c + c).join('');
+    const n = parseInt(s, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
+  const GRID = 14;        // px between dots
+  const DOT = 1.1;        // dot radius at rest
+  const R = 30;           // slab corner radius: half its height (pill)
+
+  function drawSurface() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+
+    const r = stage.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const ix = r.width / 2 - R, iy = r.height / 2 - R; // inner (straight) half extents
+    const reach = Math.min(cw, ch) * 0.5;               // the grid fades out by here
+    const quiet = calm();
+    const SPEED = quiet ? 110 : 240;  // px/s
+    const LAMBDA = quiet ? 52 : 40;   // wavelength, px
+    const PUSH = quiet ? 2.5 : 7;       // max outward shove of a dot, px
+    const dent = Math.max(-z, 0) / 0.1; // how hard the slab is pressed in
+
+    // Per-wave values that do not depend on the dot.
+    const ws = waves.map(w => ({
+      front: SPEED * w.t * (1 - w.t * 0.15),
+      amp: w.s * Math.exp(-w.t * (quiet ? 2.8 : 1.9)) * (quiet ? 0.5 : 1),
+    }));
+
+    const [dr, dg, db] = dotRGB, [kr, kg, kb] = crestRGB;
+    // Align the grid on the slab center so it sits symmetric around it.
+    const x0 = cx - Math.ceil(cx / GRID) * GRID, y0 = cy - Math.ceil(cy / GRID) * GRID;
+
+    // Resting dots are batched into a few paths by alpha level.
+    const LEVELS = 16;
+    const still = Array.from({ length: LEVELS }, () => new Path2D());
+    for (let y = y0; y < ch + GRID; y += GRID) {
+      for (let x = x0; x < cw + GRID; x += GRID) {
+        // Distance from the slab outline and the outward direction there.
+        // Offsetting a rounded rectangle gives a rounded rectangle with a
+        // bigger radius, so far out the wave fronts turn circular.
+        const qx = Math.max(-ix, Math.min(ix, x - cx));
+        const qy = Math.max(-iy, Math.min(iy, y - cy));
+        const vx = x - cx - qx, vy = y - cy - qy;
+        const len = Math.hypot(vx, vy);
+        const o = len - R;
+        if (o < 3) continue;                       // under the slab
+        const fade = 1 - smooth((o - reach * 0.3) / (reach * 0.65));
+        if (fade <= 0) continue;
+        const nx = vx / len, ny = vy / len;
+
+        // Sum the waves: a short packet of crests riding behind each front.
+        let h = 0;
+        for (const w of ws) {
+          const u = o - (w.front - LAMBDA * 0.6);
+          if (u > LAMBDA * 2 || u < -LAMBDA * 3) continue;
+          h += w.amp * Math.cos((2 * Math.PI * u) / LAMBDA) *
+            Math.exp(-(u * u) / (LAMBDA * LAMBDA * 1.4)) / (1 + o / 160);
+        }
+        // Held in, the slab dents the page: nearby dots get drawn toward it.
+        const pull = dent * 3 * Math.exp(-o / 22);
+
+        const restA = 0.42 * fade;
+        if (Math.abs(h) < 0.015 && pull < 0.05) {
+          const p = still[Math.min(LEVELS - 1, Math.round(fade * (LEVELS - 1)))];
+          p.moveTo(x + DOT, y);
+          p.arc(x, y, DOT, 0, 2 * Math.PI);
+          continue;
+        }
+        const disp = h * PUSH - pull;
+        const px = x + nx * disp, py = y + ny * disp;
+        const rad = Math.max(0.3, DOT * (1 + h * 1.4));
+        const lit = Math.min(Math.max(h, 0) * 1.4, 1); // crests darken toward ink
+        const a = Math.min(restA * (1 + Math.abs(h) * 1.6), 1);
+        ctx.fillStyle = `rgb(${dr + (kr - dr) * lit | 0} ${dg + (kg - dg) * lit | 0} ${db + (kb - db) * lit | 0} / ${a.toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(px, py, rad, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+    for (let i = 1; i < LEVELS; i++) {
+      ctx.fillStyle = `rgb(${dr} ${dg} ${db} / ${(0.42 * i / (LEVELS - 1)).toFixed(3)})`;
+      ctx.fill(still[i]);
+    }
+  }
+
+  function smooth(t) {
+    t = Math.min(Math.max(t, 0), 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  // --- Input -----------------------------------------------------------
+
+  function press() {
+    if (pressed) return;
+    pressed = true;
+    if (z <= 0.05) {
+      // Already on the page (touch, or not hovered): no fall to speak of,
+      // so the push itself is the impact.
+      impact(calm() ? 5 : 8);
+    } else {
+      vz = Math.min(vz, calm() ? -2 : -6); // the shove that starts the fall
+    }
+    wake();
+  }
+  function release() {
+    if (!pressed) return;
+    pressed = false;
+    wake();
+  }
+
+  slab.addEventListener('pointerenter', e => {
+    if (e.pointerType === 'touch') return;
+    hovered = true; wake();
+  });
+  slab.addEventListener('pointerleave', e => {
+    if (pressed) return; // captured; decided on release
+    hovered = false; wake();
+  });
+  slab.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    slab.setPointerCapture(e.pointerId);
+    press();
+  });
+  function pointerEnd(e) {
+    if (!pressed) return;
+    const r = stage.getBoundingClientRect();
+    hovered = e.pointerType !== 'touch' && e.type === 'pointerup' &&
+      e.clientX >= r.left && e.clientX <= r.right &&
+      e.clientY >= r.top && e.clientY <= r.bottom;
+    release();
+  }
+  slab.addEventListener('pointerup', pointerEnd);
+  slab.addEventListener('pointercancel', pointerEnd);
+
+  // Keyboard: keyboard focus lifts it, Space or Enter slams it.
+  slab.addEventListener('focus', () => {
+    focusLift = slab.matches(':focus-visible'); wake();
+  });
+  slab.addEventListener('blur', () => {
+    focusLift = false; release(); wake();
+  });
+  slab.addEventListener('keydown', e => {
+    if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) {
+      e.preventDefault();
+      focusLift = true;
+      press();
+    }
+  });
+  slab.addEventListener('keyup', e => {
+    if (e.key === ' ' || e.key === 'Enter') release();
+  });
+
+  addEventListener('resize', () => { sizeCanvas(); render(); });
+  dark.addEventListener('change', () => { readColors(); render(); });
+
+  sizeCanvas();
+  readColors();
+  measureLetters();
+  document.fonts.ready.then(() => { measureLetters(); render(); });
+  render();
+})();
+</script>
+</body>
+</html>
