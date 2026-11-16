@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>001 Inertia toggle</title>
+<link rel="stylesheet" href="../../shared/tokens.css">
+<style>
+  .switch {
+    --w: 160px;
+    --h: 80px;
+    --pad: 6px;
+    position: relative;
+    width: var(--w);
+    height: var(--h);
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: var(--track-off);
+    cursor: grab;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    box-shadow: inset 0 1px 2px rgb(0 0 0 / .12);
+  }
+  .switch:active { cursor: grabbing; }
+  .switch:focus-visible {
+    outline: 2px solid var(--signal);
+    outline-offset: 5px;
+  }
+  .knob {
+    position: absolute;
+    top: var(--pad);
+    left: var(--pad);
+    width: calc(var(--h) - 2 * var(--pad));
+    height: calc(var(--h) - 2 * var(--pad));
+    border-radius: 50%;
+    background: var(--knob);
+    box-shadow:
+      0 1px 1px rgb(0 0 0 / .14),
+      0 4px 10px rgb(0 0 0 / .10);
+    will-change: transform;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body class="piece">
+
+<button class="switch" role="switch" aria-checked="false" aria-label="Inertia toggle">
+  <span class="knob"></span>
+</button>
+
+<script>
+(() => {
+  const sw = document.querySelector('.switch');
+  const knob = sw.querySelector('.knob');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  const dark = matchMedia('(prefers-color-scheme: dark)');
+
+  // Geometry (px), read from CSS so the numbers live in one place.
+  let W, H, PAD, K, TRAVEL;
+  function measure() {
+    const cs = getComputedStyle(sw);
+    W = parseFloat(cs.width);
+    H = parseFloat(cs.height);
+    PAD = parseFloat(cs.getPropertyValue('--pad'));
+    K = H - 2 * PAD;          // knob diameter
+    TRAVEL = W - 2 * PAD - K; // distance the knob can move
+  }
+
+  // Track colors, re-read when the color scheme changes.
+  let offRGB, onRGB;
+  function readColors() {
+    const root = getComputedStyle(document.documentElement);
+    offRGB = hex(root.getPropertyValue('--track-off'));
+    onRGB = hex(root.getPropertyValue('--signal'));
+  }
+  function hex(s) {
+    s = s.trim().replace('#', '');
+    if (s.length === 3) s = [...s].map(c => c + c).join('');
+    const n = parseInt(s, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
+  // Physical state.
+  let x = 0, v = 0;          // knob position and velocity (px, px/s)
+  let on = false;
+  let target = 0;
+  let press = 0, pressV = 0; // 0 = released, 1 = held (springs too)
+
+  // Pointer state.
+  let dragging = false, moved = false;
+  let startPointer = 0, startX = 0;
+
+  // Springs. Released: underdamped, so momentum shows as overshoot.
+  // Dragging: stiffer and close to critical, so the knob trails the
+  // finger a little. That lag is what makes it feel heavy.
+  function spring() {
+    if (reduceMotion.matches) return { k: 700, c: 2 * Math.sqrt(700) };
+    if (dragging) return { k: 900, c: 2 * Math.sqrt(900) * 0.8 };
+    return { k: 420, c: 2 * Math.sqrt(420) * 0.42 };
+  }
+
+  // Past the ends the drag resists with growing force.
+  function rubber(d) {
+    const limit = 22;
+    return limit * (1 - Math.exp(-d / (limit * 1.6)));
+  }
+
+  function setOn(next) {
+    on = next;
+    target = on ? TRAVEL : 0;
+    sw.setAttribute('aria-checked', String(on));
+  }
+
+  // Simulation loop. Runs only while something is moving.
+  let raf = 0, last = 0;
+  function wake() {
+    if (!raf) { last = performance.now(); raf = requestAnimationFrame(tick); }
+  }
+  function tick(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30);
+    last = now;
+    const steps = 4, h = dt / steps;
+    const { k, c } = spring();
+    for (let i = 0; i < steps; i++) {
+      v += (-k * (x - target) - c * v) * h;
+      x += v * h;
+      const pk = 600, pc = 2 * Math.sqrt(pk) * 0.7;
+      pressV += (-pk * (press - (dragging ? 1 : 0)) - pc * pressV) * h;
+      press += pressV * h;
+    }
+    render();
+    const atRest = !dragging && Math.abs(v) < 0.5 && Math.abs(x - target) < 0.05
+      && Math.abs(press) < 0.002 && Math.abs(pressV) < 0.01;
+    if (atRest) {
+      x = target; v = 0; press = 0; pressV = 0;
+      render();
+      raf = 0;
+      return;
+    }
+    raf = requestAnimationFrame(tick);
+  }
+
+  function render() {
+    const over = x > TRAVEL ? x - TRAVEL : x < 0 ? x : 0;
+    const base = Math.min(Math.max(x, 0), TRAVEL);
+    let sx, sy, origin;
+
+    if (over !== 0) {
+      // Hitting an end: flatten against it, bulge vertically (keeps volume).
+      const s = Math.min(Math.abs(over) / K, 0.45);
+      sx = 1 - s * 0.75;
+      sy = 1 + s * 0.4;
+      origin = over > 0 ? 'right center' : 'left center';
+    } else {
+      // Moving fast: stretch along the direction of travel.
+      const st = Math.min(Math.abs(v) / 2400, 1) * 0.16;
+      sx = 1 + st;
+      sy = 1 - st * 0.55;
+      origin = 'center';
+    }
+
+    const p = 1 - press * 0.05; // a slight give while held
+    knob.style.transformOrigin = origin;
+    knob.style.transform =
+      `translateX(${base}px) scale(${sx * p}, ${sy * p})`;
+
+    // Track color follows the knob, with a little easing so the
+    // color commits before the knob arrives.
+    const t = Math.min(Math.max(x / TRAVEL, 0), 1);
+    const e = t * t * (3 - 2 * t);
+    const rgb = offRGB.map((a, i) => Math.round(a + (onRGB[i] - a) * e));
+    sw.style.background = `rgb(${rgb.join(',')})`;
+  }
+
+  // Pointer input.
+  let samples = [];
+  sw.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    sw.setPointerCapture(e.pointerId);
+    dragging = true;
+    moved = false;
+    startPointer = e.clientX;
+    startX = target; // drag relative to where the knob is headed
+    samples = [{ t: e.timeStamp, x: e.clientX }];
+    wake();
+  });
+
+  sw.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - startPointer;
+    if (Math.abs(dx) > 3) moved = true;
+    let raw = startX + dx;
+    if (raw > TRAVEL) raw = TRAVEL + rubber(raw - TRAVEL);
+    else if (raw < 0) raw = -rubber(-raw);
+    target = raw;
+    samples.push({ t: e.timeStamp, x: e.clientX });
+    if (samples.length > 6) samples.shift();
+    wake();
+  });
+
+  function release(e) {
+    if (!dragging) return;
+    dragging = false;
+    if (!moved) {
+      // A tap: toggle, and give the knob a push off the start.
+      setOn(!on);
+      v += (on ? 1 : -1) * 120;
+    } else {
+      // A flick: the pointer's release speed carries into the knob.
+      const a = samples[0], b = samples[samples.length - 1];
+      const dt = (b.t - a.t) / 1000;
+      const flick = dt > 0 && (e.timeStamp - b.t) < 80 ? (b.x - a.x) / dt : 0;
+      v = v * 0.5 + flick * 0.6;
+      const projected = x + v * 0.12;
+      setOn(projected > TRAVEL / 2);
+    }
+    wake();
+  }
+  sw.addEventListener('pointerup', release);
+  sw.addEventListener('pointercancel', release);
+
+  // Keyboard (Space / Enter on a button fires click with detail 0).
+  sw.addEventListener('click', e => {
+    if (e.detail !== 0) return; // pointer clicks are handled above
+    setOn(!on);
+    v += (on ? 1 : -1) * 120;
+    wake();
+  });
+  sw.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' && !on) { setOn(true); wake(); }
+    if (e.key === 'ArrowLeft' && on) { setOn(false); wake(); }
+  });
+
+  dark.addEventListener('change', () => { readColors(); render(); });
+  addEventListener('resize', () => { measure(); target = on ? TRAVEL : 0; x = target; render(); });
+
+  measure();
+  readColors();
+  render();
+})();
+</script>
+</body>
+</html>

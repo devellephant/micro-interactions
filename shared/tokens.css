@@ -1,0 +1,56 @@
+/* Shared tokens for every piece and the grid.
+   Keep this file small: palette, type, cell shape, easing. Nothing piece-specific. */
+
+:root {
+  /* Palette (light) */
+  --ground:    #E6E8E3; /* page behind the grid */
+  --cell:      #F5F6F2; /* surface of every cell / piece */
+  --ink:       #24272C; /* primary text and strong marks */
+  --muted:     #868B90; /* captions, secondary text */
+  --line:      #D3D6CF; /* hairlines */
+  --signal:    #2F4BDB; /* the one accent: "on", active, focus */
+  --knob:      #FFFFFF; /* raised elements */
+  --track-off: #CBCEC6; /* inactive tracks */
+
+  /* Cell shape */
+  --cell-ratio: 1 / 1;
+  --cell-radius: 14px;
+
+  /* Type */
+  --font: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* Motion */
+  --ease-out:    cubic-bezier(.22, 1, .36, 1);
+  --ease-in-out: cubic-bezier(.65, 0, .35, 1);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground:    #16181B;
+    --cell:      #1F2226;
+    --ink:       #E8EAE4;
+    --muted:     #7D838A;
+    --line:      #2E3237;
+    --signal:    #6E86FF;
+    --knob:      #E8EAE4;
+    --track-off: #3A3E44;
+    color-scheme: dark;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; }
+
+/* Base for a single piece page (interactions/NNN-slug/index.html) */
+body.piece {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--cell);
+  color: var(--ink);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
