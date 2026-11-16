@@ -68,9 +68,6 @@
     height: calc(var(--h) - 2 * var(--pad));
     border-radius: 50%;
     background: var(--knob);
-    box-shadow:
-      0 1px 1px rgb(0 0 0 / .14),
-      0 4px 10px rgb(0 0 0 / .10);
     will-change: transform;
     pointer-events: none;
   }
@@ -270,13 +267,6 @@
     contact.style.transform =
       `translate(${shx * 0.3}px, ${1 + 2.5 * elev + shy * 0.3}px) scale(${1 - 0.04 * elev})`;
 
-    // Knob shadow: it floats `lift` px over the plate. When pressed it
-    // comes down, so its shadow tightens; on a tilt the shadow trails the
-    // parallax shift.
-    const ka = dark.matches ? 0.42 : 0.12;
-    knob.style.boxShadow =
-      `${-px * 0.5}px ${0.5 + lift * 0.08 - py * 0.5}px ${1 + lift * 0.1}px rgb(0 0 0 / ${(ka * 1.3).toFixed(3)}),` +
-      `${-px * 1.2}px ${lift * 0.55 - py * 1.2}px ${lift * 1.5}px rgb(0 0 0 / ${ka.toFixed(3)})`;
     sw.style.setProperty('--shade', shade(ry, 'to right') + ',' + shade(-rx, 'to bottom'));
 
     // Track color follows the knob, with a little easing so the
