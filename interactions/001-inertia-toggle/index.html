@@ -6,6 +6,24 @@
 <title>001 Inertia toggle</title>
 <link rel="stylesheet" href="../../shared/tokens.css">
 <style>
+  /* The stage never moves, so it is a stable reference for pointer math,
+     and the shadows sit on it like on a table under the plate. */
+  .stage {
+    position: relative;
+    display: grid;
+  }
+  .shadow {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: #000;
+    pointer-events: none;
+    opacity: 0;
+    will-change: transform, opacity;
+  }
+  /* Fixed blurs; only transform and opacity change per frame. */
+  .shadow.ambient { filter: blur(12px); }
+  .shadow.contact { filter: blur(2.5px); inset: 3px 6px; }
   .switch {
     --w: 160px;
     --h: 80px;
@@ -21,6 +39,21 @@
     touch-action: none;
     -webkit-tap-highlight-color: transparent;
     box-shadow: inset 0 1px 2px rgb(0 0 0 / .12);
+    /* The switch is a plate on a center pivot: pressing one side of it
+       pushes that side into the screen. Kept flat (no preserve-3d) so the
+       tilted plate can never cut through the knob; the knob's height is
+       faked with a small parallax shift in JS instead. */
+    will-change: transform;
+  }
+  /* Light on the tilted plate: the side pushed away darkens, the side
+     coming toward you catches a little light. Set from JS. */
+  .switch::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--shade, none);
+    pointer-events: none;
   }
   .switch:active { cursor: grabbing; }
   .switch:focus-visible {
@@ -45,14 +78,21 @@
 </head>
 <body class="piece">
 
-<button class="switch" role="switch" aria-checked="false" aria-label="Inertia toggle">
-  <span class="knob"></span>
-</button>
+<div class="stage">
+  <span class="shadow ambient" aria-hidden="true"></span>
+  <span class="shadow contact" aria-hidden="true"></span>
+  <button class="switch" role="switch" aria-checked="false" aria-label="Inertia toggle">
+    <span class="knob"></span>
+  </button>
+</div>
 
 <script>
 (() => {
   const sw = document.querySelector('.switch');
   const knob = sw.querySelector('.knob');
+  const stage = document.querySelector('.stage');
+  const ambient = stage.querySelector('.ambient');
+  const contact = stage.querySelector('.contact');
   const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
   const dark = matchMedia('(prefers-color-scheme: dark)');
 
@@ -86,10 +126,27 @@
   let on = false;
   let target = 0;
   let press = 0, pressV = 0; // 0 = released, 1 = held (springs too)
+  let rx = 0, rxV = 0;       // plate tilt (deg) around X and Y, and their
+  let ry = 0, ryV = 0;       // angular velocities
 
   // Pointer state.
   let dragging = false, moved = false;
   let startPointer = 0, startX = 0;
+  let ptrX = 0, ptrY = 0;    // pointer relative to the plate center, -1..1 at the edges
+
+  // How far the plate tilts (deg). A press at the very edge reaches about
+  // 3/4 of this; dragging beyond the plate keeps leaning in, then saturates.
+  const TILT_Y = 20;  // pressing left/right
+  const TILT_X = 22;  // pressing top/bottom (the plate is short, so more angle)
+  const KICK = 42;    // knob slamming into an end: deg per knob-diameter of overshoot
+
+  function readPointer(e) {
+    // The stage is never transformed, so this ignores the plate's own tilt.
+    const r = stage.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ptrX = (e.clientX - cx) / (W / 2);
+    ptrY = (e.clientY - cy) / (H / 2);
+  }
 
   // Springs. Released: underdamped, so momentum shows as overshoot.
   // Dragging: stiffer and close to critical, so the knob trails the
@@ -122,18 +179,39 @@
     last = now;
     const steps = 4, h = dt / steps;
     const { k, c } = spring();
+    const calm = reduceMotion.matches;
+    // Plate: follows the finger while held, heavy and close to critical;
+    // let go, it rocks back on a looser spring.
+    const tk = dragging ? 380 : 230;
+    const tc = 2 * Math.sqrt(tk) * (calm ? 1 : dragging ? 0.75 : 0.36);
+    const amt = calm ? 0.35 : 1;
     for (let i = 0; i < steps; i++) {
       v += (-k * (x - target) - c * v) * h;
       x += v * h;
       const pk = 600, pc = 2 * Math.sqrt(pk) * 0.7;
       pressV += (-pk * (press - (dragging ? 1 : 0)) - pc * pressV) * h;
       press += pressV * h;
+
+      // When the knob overshoots an end, its momentum shoves that end of
+      // the plate into the screen. The overshoot is itself a spring, so
+      // the shove arrives and leaves with the knob's own timing.
+      const over = x > TRAVEL ? x - TRAVEL : x < 0 ? x : 0;
+      const kick = calm ? 0 : Math.max(-0.5, Math.min(0.5, over / K)) * KICK;
+      const ty = (dragging ? Math.tanh(ptrX) * TILT_Y * amt : 0) + kick;
+      const tx = dragging ? -Math.tanh(ptrY) * TILT_X * amt : 0;
+      ryV += (-tk * (ry - ty) - tc * ryV) * h;
+      ry += ryV * h;
+      rxV += (-tk * (rx - tx) - tc * rxV) * h;
+      rx += rxV * h;
     }
     render();
     const atRest = !dragging && Math.abs(v) < 0.5 && Math.abs(x - target) < 0.05
-      && Math.abs(press) < 0.002 && Math.abs(pressV) < 0.01;
+      && Math.abs(press) < 0.002 && Math.abs(pressV) < 0.01
+      && Math.abs(rx) < 0.02 && Math.abs(ry) < 0.02
+      && Math.abs(rxV) < 0.05 && Math.abs(ryV) < 0.05;
     if (atRest) {
       x = target; v = 0; press = 0; pressV = 0;
+      rx = ry = rxV = ryV = 0;
       render();
       raf = 0;
       return;
@@ -162,8 +240,44 @@
 
     const p = 1 - press * 0.05; // a slight give while held
     knob.style.transformOrigin = origin;
+    // The knob sits above the plate, so as the plate tilts it slides a
+    // little toward the side coming at you (pressed flatter while held).
+    const lift = 8 - press * 4;
+    const deg = Math.PI / 180;
+    const px = lift * Math.sin(ry * deg), py = -lift * Math.sin(rx * deg);
     knob.style.transform =
-      `translateX(${base}px) scale(${sx * p}, ${sy * p})`;
+      `translate(${base + px}px, ${py}px) scale(${sx * p}, ${sy * p})`;
+
+    // The plate sinks under the finger and tilts toward where it pushes.
+    sw.style.transform =
+      `perspective(420px) translateZ(${-press * 12}px) rotateX(${rx}deg) rotateY(${ry}deg)`;
+
+    // Shadows carry most of the depth. Light comes from above, a touch in
+    // front, so shadows fall down. The plate's height over the
+    // stage (`elev`): 1 at rest, low when pushed in.
+    const d = dark.matches ? 2.6 : 1;
+    const elev = 1 - Math.min(Math.max(press, 0), 1.2) * 0.8;
+    // A side pushed away is lower, so its shadow tucks in, while the
+    // raised side throws its shadow out. Net: the shadow slides toward
+    // the raised side.
+    const shx = -ry * 0.9, shy = rx * 0.7;
+    ambient.style.opacity = Math.min(0.2 * d * (0.55 + 0.45 * elev), 0.8);
+    ambient.style.transform =
+      `translate(${shx * elev}px, ${4 + 9 * elev + shy * elev}px) scale(${0.9 + 0.08 * elev}, ${0.84 + 0.12 * elev})`;
+    // The contact shadow is where the plate nearly touches: darkest when
+    // pushed in, and darker still on whichever end is pushed deepest.
+    contact.style.opacity = Math.min(0.1 * d * (1.9 - 0.9 * elev), 0.8);
+    contact.style.transform =
+      `translate(${shx * 0.3}px, ${1 + 2.5 * elev + shy * 0.3}px) scale(${1 - 0.04 * elev})`;
+
+    // Knob shadow: it floats `lift` px over the plate. When pressed it
+    // comes down, so its shadow tightens; on a tilt the shadow trails the
+    // parallax shift.
+    const ka = dark.matches ? 0.42 : 0.12;
+    knob.style.boxShadow =
+      `${-px * 0.5}px ${0.5 + lift * 0.08 - py * 0.5}px ${1 + lift * 0.1}px rgb(0 0 0 / ${(ka * 1.3).toFixed(3)}),` +
+      `${-px * 1.2}px ${lift * 0.55 - py * 1.2}px ${lift * 1.5}px rgb(0 0 0 / ${ka.toFixed(3)})`;
+    sw.style.setProperty('--shade', shade(ry, 'to right') + ',' + shade(-rx, 'to bottom'));
 
     // Track color follows the knob, with a little easing so the
     // color commits before the knob arrives.
@@ -173,11 +287,22 @@
     sw.style.background = `rgb(${rgb.join(',')})`;
   }
 
+  // A positive angle means the far end of `dir` is pushed away from you.
+  function shade(deg, dir) {
+    const a = Math.min(Math.abs(deg) * 0.011, 0.2);
+    if (a < 0.002) return `linear-gradient(${dir}, transparent, transparent)`;
+    const away = `rgb(0 0 0 / ${a.toFixed(3)})`;
+    const near = `rgb(255 255 255 / ${(a * 0.6).toFixed(3)})`;
+    const [from, to] = deg > 0 ? [near, away] : [away, near];
+    return `linear-gradient(${dir}, ${from}, transparent 50%, ${to})`;
+  }
+
   // Pointer input.
   let samples = [];
   sw.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
     sw.setPointerCapture(e.pointerId);
+    readPointer(e);
     dragging = true;
     moved = false;
     startPointer = e.clientX;
@@ -188,6 +313,7 @@
 
   sw.addEventListener('pointermove', e => {
     if (!dragging) return;
+    readPointer(e);
     const dx = e.clientX - startPointer;
     if (Math.abs(dx) > 3) moved = true;
     let raw = startX + dx;
@@ -225,11 +351,12 @@
     if (e.detail !== 0) return; // pointer clicks are handled above
     setOn(!on);
     v += (on ? 1 : -1) * 120;
+    pressV += 9; // a key press is a push too: a brief dip
     wake();
   });
   sw.addEventListener('keydown', e => {
-    if (e.key === 'ArrowRight' && !on) { setOn(true); wake(); }
-    if (e.key === 'ArrowLeft' && on) { setOn(false); wake(); }
+    if (e.key === 'ArrowRight' && !on) { setOn(true); pressV += 9; wake(); }
+    if (e.key === 'ArrowLeft' && on) { setOn(false); pressV += 9; wake(); }
   });
 
   dark.addEventListener('change', () => { readColors(); render(); });
